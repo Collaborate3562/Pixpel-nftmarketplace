@@ -120,13 +120,14 @@ fn init_marketplace<S: HasStateApi>(
 struct PlaceForSaleParameter {
     token_id: TokenId,
     price: TokenPrice,
-    // pixpel_nft: ContractAddress,
+    pixpel_nft: ContractAddress,
 }
 
 impl Serial for ParamWithSender<PlaceForSaleParameter> {
     fn serial<W: Write>(&self, out: &mut W) -> Result<(), W::Err> {
         self.params.token_id.serial(out)?;
         self.params.price.serial(out)?;
+        self.params.pixpel_nft.serial(out)?;
         self.sender.serial(out)
     }
 }
@@ -154,29 +155,22 @@ fn marketplace_place_for_sale<S: HasStateApi>(
         MarketplaceError::Unauthorized.into()
     );
 
-    // let transfer = Transfer::<TokenId, TokenPrice> {
-    //     token_id: param.token_id,
-    //     amount: 1.into(),
-    //     from: Address::Account(owner),
-    //     to: Receiver::Account(&ctx.self_address().clone()),
-    //     data: AdditionalData::empty(),
-    // };
+    let transfer = Transfer::<TokenId, TokenPrice> {
+        token_id: param.token_id,
+        amount: 1.into(),
+        from: Address::Account(owner),
+        to: Receiver::ContractAddress(ctx.self_address()),
+        data: AdditionalData::empty(),
+    };
 
-    // let parameter = TransferParams::from(vec![transfer]);
+    let parameter = TransferParams::from(vec![transfer]);
 
-    // let parameter = OnReceivingCis2Params {
-    //     param.token_id,
-    //     1,
-    //     from: Address::Account(owner),
-    //     to: Receiver::Contract(ctx.self_address()),
-    // };
-
-    // host.invoke_contract(
-    //     &(param.pixpel_nft),
-    //     &parameter,
-    //     EntrypointName::new_unchecked("transfer"),
-    //     Amount::zero(),
-    // );
+    host.invoke_contract(
+        &(param.pixpel_nft),
+        &parameter,
+        EntrypointName::new_unchecked("transfer"),
+        Amount::zero(),
+    );
 
     let state = host.state_mut();
 
