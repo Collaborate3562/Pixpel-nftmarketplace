@@ -62,6 +62,12 @@ impl Serial for RawReturnValue {
 type TokenId = TokenIdU32;
 type TokenPrice = TokenAmountU32;
 
+// #[derive(Debug, Serialize, SchemaType, Eq, PartialEq, PartialOrd)]
+// pub enum SaleType {
+//     Auction,
+//     FixedSale,
+// }
+
 #[derive(Debug, Serialize, SchemaType, Eq, PartialEq, PartialOrd)]
 pub enum PurchaseState {
     Sold,
@@ -126,6 +132,8 @@ impl Serial for ParamWithSender<PlaceForSaleParameter> {
     }
 }
 
+// type TransferParameter = TransferParams<TokenId, ContractTokenAmount>;
+
 #[receive(
     contract = "pixpel-nftmarketplace",
     name = "open_trade",
@@ -147,24 +155,22 @@ fn marketplace_place_for_sale<S: HasStateApi>(
         MarketplaceError::Unauthorized.into()
     );
 
-    let token_id = param.token_id;
-    let amount = concordium_cis2::TokenAmountU8(1);
-    let from = ctx.sender();
-    let data = AdditionalData::empty();
-
-    let parameter = OnReceivingCis2Params {
-        token_id,
-        amount,
-        from,
-        data,
+    let transfer = Transfer::<TokenId, TokenPrice> {
+        token_id: param.token_id,
+        amount: 1.into(),
+        from: Address::Account(owner),
+        to: Receiver::ContractAddress(ctx.self_address()),
+        data: AdditionalData::empty(),
     };
+
+    let parameter = TransferParams::from(vec![transfer]);
 
     host.invoke_contract(
         &(param.pixpel_nft),
         &parameter,
         EntrypointName::new_unchecked("transfer"),
         Amount::zero(),
-    )?;
+    );
 
     let state = host.state_mut();
 
@@ -175,7 +181,7 @@ fn marketplace_place_for_sale<S: HasStateApi>(
             state: PurchaseState::NotSoldYet
         }
     });
-
+    
     Ok(())
 }
 
@@ -184,7 +190,6 @@ struct PlaceForAuctionParameter {
     token_id: TokenId,
     price: TokenPrice,
     expiry: Timestamp,
-    pixpel_nft: ContractAddress
 }
 
 impl Serial for ParamWithSender<PlaceForAuctionParameter> {
@@ -192,7 +197,6 @@ impl Serial for ParamWithSender<PlaceForAuctionParameter> {
         self.params.token_id.serial(out)?;
         self.params.price.serial(out)?;
         self.params.expiry.serial(out)?;
-        self.params.pixpel_nft.serial(out)?;
         self.sender.serial(out)
     }
 }
@@ -219,25 +223,6 @@ fn marketplace_place_for_auction<S: HasStateApi>(
         MarketplaceError::Unauthorized.into()
     );
 
-    let token_id = param.token_id;
-    let amount = concordium_cis2::TokenAmountU8(1);
-    let from = ctx.sender();
-    let data = AdditionalData::empty();
-
-    let parameter = OnReceivingCis2Params {
-        token_id,
-        amount,
-        from,
-        data,
-    };
-
-    host.invoke_contract(
-        &(param.pixpel_nft),
-        &parameter,
-        EntrypointName::new_unchecked("transfer"),
-        Amount::zero(),
-    )?;
-
     let state = host.state_mut();
 
     state.tokens_for_auction.insert(param.token_id, {
@@ -246,7 +231,7 @@ fn marketplace_place_for_auction<S: HasStateApi>(
             state: PurchaseState::NotSoldYet,
             highest_bid: param.price,
             creator: ctx.invoker(),
-            highest_bidder: AccountAddress([0u8; 32]),
+            highest_bidder: ctx.invoker(),
             bids: collections::BTreeMap::new()
         }
     });
@@ -288,14 +273,17 @@ fn marketplace_cancel_for_trade<S: HasStateApi>(
     );
 
     let state = host.state_mut();
-    let item = state.tokens_for_sale.get(&param.token_id).unwrap();
-    let creator = item.creator;
 
-    let msgsender = ctx.sender();
+    let market_item = state.tokens_for_sale.get(&param.token_id);
+
+    // ensure!(
+    //     ctx.invoker() != market_item.creator,
+    //     MarketplaceError::Unauthorized.into()
+    // );
 
     ensure!(
-        msgsender.matches_account(&creator),
-        MarketplaceError::Unauthorized.into()
+        state.tokens_for_sale.get(&param.token_id).is_some(),
+        MarketplaceError::TokenNotFound.into()
     );
 
     state.tokens_for_sale.remove(&param.token_id);
@@ -316,35 +304,37 @@ impl Serial for ParamWithSender<BidForNftParameter> {
     }
 }
 
-#[receive(
-    contract = "pixpel-nftmarketplace",
-    name = "bid",
-    parameter = "BidForNftParameter",
-    mutable
-)]
-fn marketplace_bid_for_nft<S: HasStateApi>(
-    ctx: &impl HasReceiveContext,
-    host: &mut impl HasHost<State<S>, StateApiType = S>,
-) -> ContractResult<()> {
-    let input: ParamWithSender<BidForNftParameter> = ctx.parameter_cursor().get()?;
-    let param = input.params;
+// #[receive(
+//     contract = "pixpel-nftmarketplace",
+//     name = "bid",
+//     parameter = "BidForNftParameter",
+//     mutable
+// )]
+// fn marketplace_bid_for_nft<S: HasStateApi>(
+//     ctx: &impl HasReceiveContext,
+//     host: &mut impl HasHost<State<S>, StateApiType = S>,
+// ) -> ContractResult<()> {
+//     let input: ParamWithSender<BidForNftParameter> = ctx.parameter_cursor().get()?;
+//     let param = input.params;
 
-    let sender = input.sender;
-    let owner = ctx.owner();
+//     let sender = input.sender;
+//     let owner = ctx.owner();
 
-    ensure!(
-        sender.matches_account(&owner),
-        MarketplaceError::Unauthorized.into()
-    );
+//     ensure!(
+//         sender.matches_account(&owner),
+//         MarketplaceError::Unauthorized.into()
+//     );
 
-    let state = host.state_mut();
+//     let state = host.state_mut();
 
-    ensure!(
-        state.tokens_for_auction.get(&param.token_id).is_some(),
-        MarketplaceError::TokenNotFound.into()
-    );
+//     let market_item = state.tokens_for_auction.get(&param.token_id);
 
-    let auction_item = state.tokens_for_auction.get(&param.token_id).unwrap();
+//     state.tokens_for_auction.
 
-    Ok(())
-}
+//     ensure!(
+//         state.tokens_for_auction.get(&param.token_id).is_some(),
+//         MarketplaceError::TokenNotFound.into()
+//     );
+
+//     Ok(())
+// }
