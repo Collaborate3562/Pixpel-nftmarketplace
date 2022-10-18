@@ -1,340 +1,550 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
-use concordium_cis2::*;
 use concordium_std::*;
-use core::fmt::Debug;
+use concordium_cis2::*;
 
 #[derive(Serialize, Debug, PartialEq, Eq, Reject)]
 pub enum MarketplaceError {
-    #[from(ParseError)]
     ParseParams,
-    TokenNotFound,
+    CalledByAContract,
+    TokenNotListed,
+    Cis2ClientError(Cis2ClientError),
+    CollectionNotCis2,
+    InvalidAmountPaid,
+    InvokeTransferError,
+    NoBalance,
+    NotOperator,
+    NotMatchedSaleType,
+    NotEnoughBalance,
+    ExpiredAlready,
+    CanNotBidYourSelf,
+    CanceledAlready,
     Unauthorized,
+    NotBidded,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq, Reject)]
+pub enum Cis2ClientError {
     InvokeContractError,
+    ParseParams,
+    ParseResult,
 }
 
-pub type ContractError = Cis2Error<MarketplaceError>;
-pub type ContractResult<A> = Result<A, ContractError>;
+pub const SUPPORTS_ENTRYPOINT_NAME: &str = "supports";
+pub const OPERATOR_OF_ENTRYPOINT_NAME: &str = "operatorOf";
+pub const BALANCE_OF_ENTRYPOINT_NAME: &str = "balanceOf";
+pub const TRANSFER_ENTRYPOINT_NAME: &str = "transfer";
 
-impl<T> From<CallContractError<T>> for MarketplaceError {
-    fn from(_e: CallContractError<T>) -> Self {
-        MarketplaceError::InvokeContractError
+pub type ContractTokenAmount = TokenAmountU8;
+type ContractBalanceOfQueryParams = BalanceOfQueryParams<ContractTokenId>;
+type ContractBalanceOfQueryResponse = BalanceOfQueryResponse<ContractTokenAmount>;
+type TransferParameter = TransferParams<ContractTokenId, ContractTokenAmount>;
+
+type ContractResult<A> = Result<A, MarketplaceError>;
+
+pub type ContractTokenId = TokenIdU32;
+
+#[derive(Clone, Serialize, SchemaType)]
+struct TokenInfo {
+    pub id: ContractTokenId,
+    pub address: ContractAddress,
+}
+
+impl TokenInfo {
+    fn new(id: ContractTokenId, address: ContractAddress) -> Self {
+        TokenInfo { id, address }
     }
 }
 
-impl From<MarketplaceError> for ContractError {
-    fn from(c: MarketplaceError) -> Self {
-        Cis2Error::Custom(c)
-    }
+#[derive(SchemaType, Clone, Serialize, Copy, PartialEq, Eq, Debug)]
+enum TokenListState {
+    UnListed,
+    Listed,
 }
 
-#[derive(Debug, SchemaType, Eq, PartialEq)]
-pub struct ParamWithSender<T> {
-    pub params: T,
-    pub sender: Address,
+#[derive(SchemaType, Clone, Serialize, Copy, PartialEq, Eq, Debug)]
+enum TokenSaleTypeState {
+    Fixed,
+    Auction,
 }
 
-impl Serial for ParamWithSender<Vec<u8>> {
-    fn serial<W: Write>(&self, out: &mut W) -> Result<(), W::Err> {
-        out.write_all(&self.params)?;
-        self.sender.serial(out)
-    }
-}
-
-impl<T: Deserial> Deserial for ParamWithSender<T> {
-    fn deserial<R: Read>(source: &mut R) -> ParseResult<Self> {
-        let params = T::deserial(source)?;
-        let sender = Address::deserial(source)?;
-        Ok(ParamWithSender {
-            params,
-            sender,
-        })
-    }
-}
-
-#[derive(PartialEq, Eq, Debug)]
-struct RawReturnValue(Vec<u8>);
-
-impl Serial for RawReturnValue {
-    fn serial<W: Write>(&self, out: &mut W) -> Result<(), W::Err> { out.write_all(&self.0) }
-}
-
-type TokenId = TokenIdU32;
-type TokenPrice = TokenAmountU32;
-
-// #[derive(Debug, Serialize, SchemaType, Eq, PartialEq, PartialOrd)]
-// pub enum SaleType {
-//     Auction,
-//     FixedSale,
-// }
-
-#[derive(Debug, Serialize, SchemaType, Eq, PartialEq, PartialOrd)]
-pub enum PurchaseState {
-    Sold,
-    NotSoldYet
-}
-
-#[derive(Debug, Serialize, SchemaType, Eq, PartialEq)]
-pub struct MarketItem {
-    creator: AccountAddress,
-    price: TokenPrice,
-    state: PurchaseState
-}
-
-#[derive(Debug, Serialize, SchemaType, Eq, PartialEq)]
-struct AuctionItem {
-    expiry: Timestamp,
-    state: PurchaseState,
-    highest_bid: TokenPrice,
-    creator: AccountAddress,
+#[derive(Clone, Serialize, SchemaType)]
+struct TokenState {
+    sale_type: TokenSaleTypeState,
+    curr_state: TokenListState,
+    owner: AccountAddress,
+    expiry: u64,
     highest_bidder: AccountAddress,
-    #[concordium(size_length = 2)]
-    bids: collections::BTreeMap<AccountAddress, Amount>,
+    price: Amount,
 }
 
-#[derive(Serial, DeserialWithState, Deletable)]
+#[derive(Serial, DeserialWithState, StateClone)]
 #[concordium(state_parameter = "S")]
-struct State<S> {
-    tokens_for_sale: StateMap<TokenId, MarketItem, S>,
-    tokens_for_auction: StateMap<TokenId, AuctionItem, S>
+struct State<S>
+{
+    tokens: StateMap<TokenInfo, TokenState, S>,
 }
 
 impl<S: HasStateApi> State<S> {
-    fn empty(state_builder: &mut StateBuilder<S>) -> State<S> {
+    fn new(state_builder: &mut StateBuilder<S>) -> Self {
         State {
-            tokens_for_sale: state_builder.new_map(),
-            tokens_for_auction: state_builder.new_map(),
+            tokens: state_builder.new_map(),
         }
     }
 }
 
-#[init(contract = "pixpel-nftmarketplace")]
-fn init_marketplace<S: HasStateApi>(
+#[init(contract = "Pixpel-NFTMarketplace")]
+fn init<S: HasStateApi>(
     _ctx: &impl HasInitContext,
     state_builder: &mut StateBuilder<S>,
-) -> ContractResult<State<S>> {
-    Ok(State::empty(state_builder))
+) -> InitResult<State<S>> {
+    Ok(State::new(state_builder))
 }
 
-#[derive(SchemaType, Serial, Deserial)]
-struct PlaceForSaleParameter {
-    token_id: TokenId,
-    price: TokenPrice,
-    pixpel_nft: ContractAddress,
+#[derive(Serial, Deserial, SchemaType)]
+struct PlaceIntoMarketParams {
+    nft_contract_address: ContractAddress,
+    token_id: ContractTokenId,
+    price: Amount,
+    sale_type: u8,
+    expiry: u64,
 }
-
-impl Serial for ParamWithSender<PlaceForSaleParameter> {
-    fn serial<W: Write>(&self, out: &mut W) -> Result<(), W::Err> {
-        self.params.token_id.serial(out)?;
-        self.params.price.serial(out)?;
-        self.params.pixpel_nft.serial(out)?;
-        self.sender.serial(out)
-    }
-}
-
-// type TransferParameter = TransferParams<TokenId, ContractTokenAmount>;
 
 #[receive(
-    contract = "pixpel-nftmarketplace",
-    name = "open_trade",
-    parameter = "PlaceForSaleParameter",
+    contract = "Pixpel-NFTMarketplace",
+    name = "place_into_market",
+    parameter = "PlaceIntoMarketParams",
     mutable
 )]
-fn marketplace_place_for_sale<S: HasStateApi>(
+fn add<S: HasStateApi>(
     ctx: &impl HasReceiveContext,
     host: &mut impl HasHost<State<S>, StateApiType = S>,
 ) -> ContractResult<()> {
-    let input: ParamWithSender<PlaceForSaleParameter> = ctx.parameter_cursor().get()?;
-    let param = input.params;
+    let params: PlaceIntoMarketParams = ctx
+        .parameter_cursor()
+        .get()
+        .map_err(|_e| MarketplaceError::ParseParams)?;
 
-    let sender = input.sender;
-    let owner = ctx.owner();
+    ensure_supports_cis2(host, &params.nft_contract_address)?;
+    ensure_is_operator(host, ctx, &params.nft_contract_address)?;
+    ensure_balance(host, params.token_id, &params.nft_contract_address, ctx)?;
 
-    ensure!(
-        sender.matches_account(&owner),
-        MarketplaceError::Unauthorized.into()
-    );
-
-    let transfer = Transfer::<TokenId, TokenPrice> {
-        token_id: param.token_id,
-        amount: 1.into(),
-        from: Address::Account(owner),
-        to: Receiver::ContractAddress(ctx.self_address()),
-        data: AdditionalData::empty(),
-    };
-
-    let parameter = TransferParams::from(vec![transfer]);
-
-    host.invoke_contract(
-        &(param.pixpel_nft),
-        &parameter,
-        EntrypointName::new_unchecked("transfer"),
-        Amount::zero(),
-    );
-
-    let state = host.state_mut();
-
-    state.tokens_for_sale.insert(param.token_id, {
-        MarketItem {
-            creator: ctx.invoker(),
-            price: param.price,
-            state: PurchaseState::NotSoldYet
-        }
-    });
-    
-    Ok(())
-}
-
-#[derive(SchemaType, Serial, Deserial)]
-struct PlaceForAuctionParameter {
-    token_id: TokenId,
-    price: TokenPrice,
-    expiry: Timestamp,
-}
-
-impl Serial for ParamWithSender<PlaceForAuctionParameter> {
-    fn serial<W: Write>(&self, out: &mut W) -> Result<(), W::Err> {
-        self.params.token_id.serial(out)?;
-        self.params.price.serial(out)?;
-        self.params.expiry.serial(out)?;
-        self.sender.serial(out)
+    let info = TokenInfo::new(params.token_id, params.nft_contract_address);
+    let sale_type;
+    if params.sale_type == 0 {
+        sale_type = TokenSaleTypeState::Fixed;
+    } else {
+        sale_type = TokenSaleTypeState::Auction;
     }
+
+    let curr_state = TokenListState::Listed;
+    let owner = ctx.invoker();
+    let highest_bidder = AccountAddress([0u8; 32]);
+    let expiry = 0u64;
+    let price = params.price;
+
+    if host.state_mut().tokens.get(&info).is_some() {
+        let mut token_state = host
+            .state_mut()
+            .tokens
+            .entry(info)
+            .occupied_or(MarketplaceError::TokenNotListed)?;
+        token_state.owner = owner;
+        token_state.highest_bidder = highest_bidder;
+        token_state.sale_type = sale_type;
+        token_state.curr_state = curr_state;
+        token_state.expiry = params.expiry;
+        token_state.price = params.price;
+    } else {
+        host.state_mut().tokens.insert(
+            info,
+            TokenState {
+                sale_type,
+                curr_state,
+                owner,
+                expiry,
+                highest_bidder,
+                price
+            },
+        );
+    }
+    ContractResult::Ok(())
 }
 
+#[derive(Serial, Deserial, SchemaType)]
+struct TradeNftParams {
+    nft_contract_address: ContractAddress,
+    token_id: ContractTokenId,
+    price: Amount,
+    sale_type: u8
+}
 
 #[receive(
-    contract = "pixpel-nftmarketplace",
-    name = "create_auction",
-    parameter = "PlaceForAuctionParameter",
-    mutable
+    contract = "Pixpel-NFTMarketplace",
+    name = "trade_market",
+    parameter = "TradeNftParams",
+    mutable,
+    payable
 )]
-fn marketplace_place_for_auction<S: HasStateApi>(
+fn trade_nft<S:HasStateApi>(
     ctx: &impl HasReceiveContext,
     host: &mut impl HasHost<State<S>, StateApiType = S>,
+    amount: Amount
 ) -> ContractResult<()> {
-    let input: ParamWithSender<PlaceForAuctionParameter> = ctx.parameter_cursor().get()?;
-    let param = input.params;
+    let params: TradeNftParams = ctx
+        .parameter_cursor()
+        .get()
+        .map_err(|_e| MarketplaceError::ParseParams)?;
 
-    let sender = input.sender;
-    let owner = ctx.owner();
+    let info = TokenInfo::new(params.token_id, params.nft_contract_address);
+    ensure!(host.state_mut().tokens.get(&info).is_some(), MarketplaceError::TokenNotListed);
 
+    let mut token_state = host
+        .state_mut()
+        .tokens
+        .entry(info)
+        .occupied_or(MarketplaceError::TokenNotListed)?.to_owned();
+
+    let price = token_state.price;
     ensure!(
-        sender.matches_account(&owner),
-        MarketplaceError::Unauthorized.into()
+        amount.cmp(&price).is_gt(),
+        MarketplaceError::NotEnoughBalance
     );
-
-    let state = host.state_mut();
-
-    state.tokens_for_auction.insert(param.token_id, {
-        AuctionItem {
-            expiry: param.expiry,
-            state: PurchaseState::NotSoldYet,
-            highest_bid: param.price,
-            creator: ctx.invoker(),
-            highest_bidder: ctx.invoker(),
-            bids: collections::BTreeMap::new()
-        }
-    });
     
-    Ok(())
-}
+    if params.sale_type == 0 {
+        ensure!(token_state.sale_type == TokenSaleTypeState::Fixed, MarketplaceError::NotMatchedSaleType);
 
-#[derive(SchemaType, Serial, Deserial)]
-struct CancelForTradeParameter {
-    token_id: TokenId,
-}
+        Cis2Client::transfer(
+            host,
+            params.token_id,
+            params.nft_contract_address,
+            concordium_cis2::TokenAmountU8(1),
+            token_state.owner,
+            concordium_cis2::Receiver::Account(ctx.invoker()),
+        )
+        .map_err(MarketplaceError::Cis2ClientError)?;
 
-impl Serial for ParamWithSender<CancelForTradeParameter> {
-    fn serial<W: Write>(&self, out: &mut W) -> Result<(), W::Err> {
-        self.params.token_id.serial(out)?;
-        self.sender.serial(out)
+        host.invoke_transfer(&token_state.owner, amount)
+            .map_err(|_| MarketplaceError::InvokeTransferError)?;
+            
+        token_state.owner = ctx.invoker();
+        token_state.sale_type = TokenSaleTypeState::Fixed;
+        token_state.curr_state = TokenListState::UnListed;
+        token_state.expiry = 0u64;
+        token_state.highest_bidder = AccountAddress([0u8;32]);
+        token_state.price = Amount { micro_ccd: 0u64 };
+    } else if params.sale_type == 1 {
+        ensure!(token_state.sale_type == TokenSaleTypeState::Auction, MarketplaceError::NotMatchedSaleType);
+
+        let slot_time = ctx.metadata().slot_time();
+
+        ensure!(concordium_std::Timestamp::timestamp_millis(&slot_time) <= token_state.expiry, MarketplaceError::ExpiredAlready);
+        ensure!(ctx.invoker() != token_state.owner, MarketplaceError::CanNotBidYourSelf);
+        if token_state.highest_bidder != AccountAddress([0u8; 32]) {
+            host.invoke_transfer(&token_state.highest_bidder, token_state.price )
+            .map_err(|_| MarketplaceError::InvokeTransferError)?;
+        }
+
+        token_state.highest_bidder = ctx.invoker();
+        token_state.price = amount;
     }
+
+    ContractResult::Ok(())
+}
+
+#[derive(Serial, Deserial, SchemaType)]
+struct CancelTradeParams {
+    nft_contract_address: ContractAddress,
+    token_id: ContractTokenId,
+    sale_type: u8,
 }
 
 #[receive(
-    contract = "pixpel-nftmarketplace",
+    contract = "Pixpel-NFTMarketplace",
     name = "cancel_trade",
-    parameter = "CancelForTradeParameter",
+    parameter = "CancelTradeParams",
     mutable
 )]
-fn marketplace_cancel_for_trade<S: HasStateApi>(
+fn cancel_trade<S:HasStateApi>(
     ctx: &impl HasReceiveContext,
-    host: &mut impl HasHost<State<S>, StateApiType = S>,
+    host: &mut impl HasHost<State<S>, StateApiType = S>
 ) -> ContractResult<()> {
-    let input: ParamWithSender<CancelForTradeParameter> = ctx.parameter_cursor().get()?;
-    let param = input.params;
+    let params: CancelTradeParams = ctx
+        .parameter_cursor()
+        .get()
+        .map_err(|_e| MarketplaceError::ParseParams)?;
 
-    let sender = input.sender;
-    let owner = ctx.owner();
-
+    let info = TokenInfo::new(params.token_id, params.nft_contract_address);
+    ensure!(host.state_mut().tokens.get(&info).is_some(), MarketplaceError::TokenNotListed);
+    
+    let mut token_state = host
+        .state_mut()
+        .tokens
+        .entry(info)
+        .occupied_or(MarketplaceError::TokenNotListed)?.to_owned();
+        
+    ensure!(token_state.curr_state == TokenListState::Listed, MarketplaceError::CanceledAlready);
+    let sender = ctx.sender();
     ensure!(
-        sender.matches_account(&owner),
-        MarketplaceError::Unauthorized.into()
+        sender.matches_account(&token_state.owner),
+        MarketplaceError::Unauthorized
     );
 
-    let state = host.state_mut();
+    if params.sale_type == 0 {
+        ensure!(token_state.sale_type == TokenSaleTypeState::Fixed, MarketplaceError::NotMatchedSaleType);   
+    } else if params.sale_type == 1 {
+        ensure!(token_state.sale_type == TokenSaleTypeState::Auction, MarketplaceError::NotMatchedSaleType);
+    }
 
-    let market_item = state.tokens_for_sale.get(&param.token_id);
+    token_state.sale_type = TokenSaleTypeState::Fixed;
+    token_state.curr_state = TokenListState::UnListed;
+    token_state.expiry = 0u64;
+    token_state.highest_bidder = AccountAddress([0u8; 32]);
+    token_state.price = Amount { micro_ccd: 0u64 };
 
-    // ensure!(
-    //     ctx.invoker() != market_item.creator,
-    //     MarketplaceError::Unauthorized.into()
-    // );
+    ContractResult::Ok(())
+}
 
+#[derive(Serial, Deserial, SchemaType)]
+struct FinaliseTradeParams {
+    nft_contract_address: ContractAddress,
+    token_id: ContractTokenId,
+    sale_type: u8,
+}
+
+#[receive(
+    contract = "Pixpel-NFTMarketplace",
+    name = "finalise_trade",
+    parameter = "FinaliseTradeParams",
+    mutable
+)]
+fn finalise_trade<S:HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &mut impl HasHost<State<S>, StateApiType = S>
+) -> ContractResult<()> {
+    let params: FinaliseTradeParams = ctx
+        .parameter_cursor()
+        .get()
+        .map_err(|_e| MarketplaceError::ParseParams)?;
+    
+    ensure!(params.sale_type.cmp(&1u8).is_ge(), MarketplaceError::NotMatchedSaleType);
+    
+    let info = TokenInfo::new(params.token_id, params.nft_contract_address);
+    ensure!(host.state_mut().tokens.get(&info).is_some(), MarketplaceError::TokenNotListed);
+    
+    let mut token_state = host
+        .state_mut()
+        .tokens
+        .entry(info)
+        .occupied_or(MarketplaceError::TokenNotListed)?.to_owned();
+    
+    let sender = ctx.sender();
     ensure!(
-        state.tokens_for_sale.get(&param.token_id).is_some(),
-        MarketplaceError::TokenNotFound.into()
+        sender.matches_account(&token_state.owner),
+        MarketplaceError::Unauthorized  
     );
 
-    state.tokens_for_sale.remove(&param.token_id);
-    Ok(())
+    if token_state.highest_bidder != AccountAddress([0u8; 32]) {
+        host.invoke_transfer(&token_state.owner, token_state.price )
+            .map_err(|_| MarketplaceError::InvokeTransferError)?;
+
+        Cis2Client::transfer(
+            host,
+            params.token_id,
+            params.nft_contract_address,
+            concordium_cis2::TokenAmountU8(1),
+            token_state.owner,
+            concordium_cis2::Receiver::Account(ctx.invoker()),
+        )
+        .map_err(MarketplaceError::Cis2ClientError)?;
+
+        token_state.owner = ctx.invoker();
+        token_state.sale_type = TokenSaleTypeState::Fixed;
+        token_state.curr_state = TokenListState::UnListed;
+        token_state.expiry = 0u64;
+        token_state.highest_bidder = AccountAddress([0u8; 32]);
+        token_state.price = Amount { micro_ccd: 0u64 };
+    } else {
+        bail!(MarketplaceError::NotBidded)
+    }
+
+    ContractResult::Ok(())
 }
 
-#[derive(SchemaType, Serial, Deserial)]
-struct BidForNftParameter {
-    token_id: TokenId,
-    price: TokenPrice
-}
+pub struct Cis2Client;
 
-impl Serial for ParamWithSender<BidForNftParameter> {
-    fn serial<W: Write>(&self, out: &mut W) -> Result<(), W::Err> {
-        self.params.token_id.serial(out)?;
-        self.params.price.serial(out)?;
-        self.sender.serial(out)
+impl Cis2Client {
+    pub(crate) fn supports_cis2<S: HasStateApi>(
+        host: &mut impl HasHost<State<S>, StateApiType = S>,
+        nft_contract_address: &ContractAddress,
+    ) -> Result<bool, Cis2ClientError> {
+        let params = SupportsQueryParams {
+            queries: vec![StandardIdentifierOwned::new_unchecked("CIS-2".to_string())],
+        };
+        let parsed_res: SupportsQueryResponse = Cis2Client::invoke_contract_read_only(
+            host,
+            nft_contract_address,
+            SUPPORTS_ENTRYPOINT_NAME,
+            &params,
+        )?;
+        let supports_cis2: bool = {
+            let f = parsed_res
+                .results
+                .first()
+                .ok_or(Cis2ClientError::InvokeContractError)?;
+            match f {
+                SupportResult::NoSupport => false,
+                SupportResult::Support => true,
+                SupportResult::SupportBy(_) => false,
+            }
+        };
+
+        Ok(supports_cis2)
+    }
+
+    pub(crate) fn is_operator_of<S: HasStateApi>(
+        host: &mut impl HasHost<State<S>, StateApiType = S>,
+        owner: Address,
+        current_contract_address: ContractAddress,
+        nft_contract_address: &ContractAddress,
+    ) -> Result<bool, Cis2ClientError> {
+        let params = &OperatorOfQueryParams {
+            queries: vec![OperatorOfQuery {
+                owner,
+                address: Address::Contract(current_contract_address),
+            }],
+        };
+
+        let parsed_res: OperatorOfQueryResponse = Cis2Client::invoke_contract_read_only(
+            host,
+            nft_contract_address,
+            OPERATOR_OF_ENTRYPOINT_NAME,
+            params,
+        )?;
+
+        let is_operator = parsed_res
+            .0
+            .first()
+            .ok_or(Cis2ClientError::InvokeContractError)?
+            .to_owned();
+
+        Ok(is_operator)
+    }
+
+    pub(crate) fn has_balance<S: HasStateApi>(
+        host: &mut impl HasHost<State<S>, StateApiType = S>,
+        token_id: ContractTokenId,
+        nft_contract_address: &ContractAddress,
+        owner: Address,
+    ) -> Result<bool, Cis2ClientError> {
+        let params = ContractBalanceOfQueryParams {
+            queries: vec![BalanceOfQuery {
+                token_id,
+                address: owner,
+            }],
+        };
+
+        let parsed_res: ContractBalanceOfQueryResponse = Cis2Client::invoke_contract_read_only(
+            host,
+            nft_contract_address,
+            BALANCE_OF_ENTRYPOINT_NAME,
+            &params,
+        )?;
+
+        let is_operator = parsed_res
+            .0
+            .first()
+            .ok_or(Cis2ClientError::InvokeContractError)?
+            .to_owned();
+
+        Result::Ok(is_operator.cmp(&TokenAmountU8(1)).is_ge())
+    }
+
+    pub(crate) fn transfer<S: HasStateApi>(
+        host: &mut impl HasHost<State<S>, StateApiType = S>,
+        token_id: TokenIdU32,
+        nft_contract_address: ContractAddress,
+        amount: ContractTokenAmount,
+        from: AccountAddress,
+        to: Receiver,
+    ) -> Result<bool, Cis2ClientError> {
+        let params: TransferParameter = TransferParams(vec![Transfer {
+            token_id,
+            amount,
+            from: concordium_std::Address::Account(from),
+            data: AdditionalData::empty(),
+            to,
+        }]);
+
+        Cis2Client::invoke_contract_read_only(
+            host,
+            &nft_contract_address,
+            TRANSFER_ENTRYPOINT_NAME,
+            &params,
+        )?;
+
+        Result::Ok(true)
+    }
+
+    fn invoke_contract_read_only<S: HasStateApi, R: Deserial, P: Serial>(
+        host: &mut impl HasHost<State<S>, StateApiType = S>,
+        contract_address: &ContractAddress,
+        entrypoint_name: &str,
+        params: &P,
+    ) -> Result<R, Cis2ClientError> {
+        let invoke_contract_result = host
+            .invoke_contract_read_only(
+                contract_address,
+                params,
+                EntrypointName::new(entrypoint_name).unwrap_abort(),
+                Amount::from_ccd(0),
+            )
+            .map_err(|_e| Cis2ClientError::InvokeContractError)?;
+        let mut invoke_contract_res = match invoke_contract_result {
+            Some(s) => s,
+            None => return Result::Err(Cis2ClientError::InvokeContractError),
+        };
+        let parsed_res =
+            R::deserial(&mut invoke_contract_res).map_err(|_e| Cis2ClientError::ParseResult)?;
+
+        Ok(parsed_res)
     }
 }
 
-// #[receive(
-//     contract = "pixpel-nftmarketplace",
-//     name = "bid",
-//     parameter = "BidForNftParameter",
-//     mutable
-// )]
-// fn marketplace_bid_for_nft<S: HasStateApi>(
-//     ctx: &impl HasReceiveContext,
-//     host: &mut impl HasHost<State<S>, StateApiType = S>,
-// ) -> ContractResult<()> {
-//     let input: ParamWithSender<BidForNftParameter> = ctx.parameter_cursor().get()?;
-//     let param = input.params;
+fn ensure_supports_cis2<S: HasStateApi>(
+    host: &mut impl HasHost<State<S>, StateApiType = S>,
+    nft_contract_address: &ContractAddress,
+) -> Result<(), MarketplaceError> {
+    let supports_cis2 = Cis2Client::supports_cis2(host, nft_contract_address)
+        .map_err(MarketplaceError::Cis2ClientError)?;
+    ensure!(supports_cis2, MarketplaceError::CollectionNotCis2);
+    Ok(())
+}
 
-//     let sender = input.sender;
-//     let owner = ctx.owner();
+fn ensure_is_operator<S: HasStateApi>(
+    host: &mut impl HasHost<State<S>, StateApiType = S>,
+    ctx: &impl HasReceiveContext<()>,
+    nft_contract_address: &ContractAddress,
+) -> Result<(), MarketplaceError> {
+    let is_operator = Cis2Client::is_operator_of(
+        host,
+        ctx.sender(),
+        ctx.self_address(),
+        nft_contract_address,
+    )
+    .map_err(MarketplaceError::Cis2ClientError)?;
+    ensure!(is_operator, MarketplaceError::NotOperator);
+    Ok(())
+}
 
-//     ensure!(
-//         sender.matches_account(&owner),
-//         MarketplaceError::Unauthorized.into()
-//     );
-
-//     let state = host.state_mut();
-
-//     let market_item = state.tokens_for_auction.get(&param.token_id);
-
-//     state.tokens_for_auction.
-
-//     ensure!(
-//         state.tokens_for_auction.get(&param.token_id).is_some(),
-//         MarketplaceError::TokenNotFound.into()
-//     );
-
-//     Ok(())
-// }
+fn ensure_balance<S: HasStateApi>(
+    host: &mut impl HasHost<State<S>, StateApiType = S>,
+    token_id: ContractTokenId,
+    nft_contract_address: &ContractAddress,
+    ctx: &impl HasReceiveContext<()>,
+) -> Result<(), MarketplaceError> {
+    let has_balance = Cis2Client::has_balance(host, token_id, nft_contract_address, ctx.sender())
+        .map_err(MarketplaceError::Cis2ClientError)?;
+    ensure!(has_balance, MarketplaceError::NoBalance);
+    Ok(())
+}
